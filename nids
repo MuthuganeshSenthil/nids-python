@@ -1,0 +1,252 @@
+# nids.py
+# Days 3 + 4 — Filtering + Threat Detection
+# Run with: sudo python3 nids.py
+
+from scapy.all import sniff, IP, TCP, UDP, ICMP
+from datetime import datetime
+from collections import defaultdict, Counter
+
+# ─── CONFIGURATION ────────────────────────────────────────────
+INTERFACE    = None       # Change to eth0 if needed
+MAX_STORE    = 1000          # Max packets kept in memory
+
+# Filter: "ALL", "TCP", "UDP", or "ICMP"
+FILTER_PROTO = "ALL"
+
+# Port scan: if one IP hits this many different ports in the
+# last TIME_WINDOW_SECONDS seconds — it's a scan
+PORT_SCAN_THRESHOLD = 10     # number of unique ports
+TIME_WINDOW_SECONDS = 5      # within this many seconds
+
+# Ping flood: if one IP sends this many ICMP packets
+# in TIME_WINDOW_SECONDS — it's a flood
+PING_FLOOD_THRESHOLD = 5
+
+# Your own blacklist — IPs that should never appear
+# Add any IP you want to test with
+BLACKLISTED_IPS = {
+    "10.0.0.99",
+    "192.168.1.254",
+    "1.2.3.4",
+}
+# ──────────────────────────────────────────────────────────────
+
+packet_store = []    # All packets as dicts (Day 2 memory)
+alert_log    = []    # All alerts generated
+packet_number = 0
+
+# defaultdict(list) is like a dictionary where every new key
+# automatically starts with an empty list.
+# e.g.  port_history["1.2.3.4"].append(80)
+# works even if "1.2.3.4" was never added before.
+port_history  = defaultdict(list)   # ip -> [(timestamp, port), ...]
+icmp_history  = defaultdict(list)   # ip -> [timestamp, ...]
+
+
+# ─── HELPER ───────────────────────────────────────────────────
+def get_protocol(packet):
+    if TCP  in packet: return "TCP"
+    elif UDP  in packet: return "UDP"
+    elif ICMP in packet: return "ICMP"
+    else: return "OTHER"
+
+def now_ts():
+    """Current time as a readable string."""
+    return datetime.now().strftime("%H:%M:%S")
+
+def now_sec():
+    """Current time as a float (seconds since epoch).
+    Used for math like: is this packet within 5 seconds of that one?
+    """
+    return datetime.now().timestamp()
+
+
+# ─── DAY 3: FILTER ────────────────────────────────────────────
+def passes_filter(packet):
+    """
+    Returns True if the packet matches our protocol filter.
+    If FILTER_PROTO is "ALL", every packet passes.
+    Otherwise only packets matching the chosen protocol pass.
+    """
+    if FILTER_PROTO == "ALL":
+        return True
+    if FILTER_PROTO == "TCP"  and TCP  in packet: return True
+    if FILTER_PROTO == "UDP"  and UDP  in packet: return True
+    if FILTER_PROTO == "ICMP" and ICMP in packet: return True
+    return False
+
+
+# ─── ALERT ENGINE ─────────────────────────────────────────────
+def raise_alert(alert_type, src_ip, detail):
+    """
+    Central place where all alerts are created and printed.
+    Every alert is also saved into alert_log for later use
+    (Phase 3 will write these to CSV and SQLite).
+    """
+    alert = {
+        "timestamp"  : now_ts(),
+        "type"       : alert_type,
+        "src_ip"     : src_ip,
+        "detail"     : detail,
+    }
+    alert_log.append(alert)
+
+    # Print with a loud prefix so it stands out
+    print(f"\n  *** ALERT [{alert['timestamp']}] ***")
+    print(f"  Type    : {alert_type}")
+    print(f"  Source  : {src_ip}")
+    print(f"  Detail  : {detail}")
+    print(f"  Total alerts so far: {len(alert_log)}\n")
+
+
+# ─── DAY 4: THREAT DETECTORS ──────────────────────────────────
+
+def check_blacklist(src_ip, dst_ip):
+    """
+    Check if either IP is on our blacklist.
+    Simple but effective for known bad IPs.
+    """
+    if src_ip in BLACKLISTED_IPS:
+        raise_alert("BLACKLISTED_IP", src_ip,
+                    f"Source IP {src_ip} is on the blacklist")
+    if dst_ip in BLACKLISTED_IPS:
+        raise_alert("BLACKLISTED_IP", dst_ip,
+                    f"Destination IP {dst_ip} is on the blacklist")
+
+
+def check_port_scan(src_ip, dst_port):
+    """
+    A port scan = one IP hitting many different ports quickly.
+    Logic:
+      1. Record every (time, port) this IP has tried
+      2. Throw away records older than TIME_WINDOW_SECONDS
+      3. Count how many UNIQUE ports remain
+      4. If unique ports > PORT_SCAN_THRESHOLD → alert
+    """
+    if dst_port is None:
+        return
+
+    current_time = now_sec()
+
+    # Add this new (time, port) pair
+    port_history[src_ip].append((current_time, dst_port))
+
+    # Remove old entries outside the time window
+    # We keep only entries where the timestamp is recent enough
+    port_history[src_ip] = [
+        (t, p) for (t, p) in port_history[src_ip]
+        if current_time - t <= TIME_WINDOW_SECONDS
+    ]
+
+    # Count unique ports in the remaining window
+    unique_ports = set(p for (t, p) in port_history[src_ip])
+
+    if len(unique_ports) >= PORT_SCAN_THRESHOLD:
+        raise_alert(
+            "PORT_SCAN",
+            src_ip,
+            f"Hit {len(unique_ports)} unique ports in "
+            f"{TIME_WINDOW_SECONDS}s: {sorted(unique_ports)}"
+        )
+        # Clear history after alerting so we don't spam
+        port_history[src_ip] = []
+
+
+def check_ping_flood(src_ip):
+    """
+    A ping flood = one IP sending too many ICMP packets fast.
+    Same sliding window idea as port scan detection.
+    """
+    current_time = now_sec()
+
+    # Record this ping's timestamp
+    icmp_history[src_ip].append(current_time)
+
+    # Drop old timestamps outside the window
+    icmp_history[src_ip] = [
+        t for t in icmp_history[src_ip]
+        if current_time - t <= TIME_WINDOW_SECONDS
+    ]
+
+    count = len(icmp_history[src_ip])
+
+    if count >= PING_FLOOD_THRESHOLD:
+        raise_alert(
+            "PING_FLOOD",
+            src_ip,
+            f"{count} ICMP packets in {TIME_WINDOW_SECONDS}s"
+        )
+        icmp_history[src_ip] = []   # Reset after alert
+
+
+# ─── PACKET PROCESSOR ─────────────────────────────────────────
+def extract_info(packet):
+    proto    = get_protocol(packet)
+    src_port = None
+    dst_port = None
+    if TCP in packet:
+        src_port = packet[TCP].sport
+        dst_port = packet[TCP].dport
+    elif UDP in packet:
+        src_port = packet[UDP].sport
+        dst_port = packet[UDP].dport
+    return {
+        "timestamp" : now_ts(),
+        "src_ip"    : packet[IP].src,
+        "dst_ip"    : packet[IP].dst,
+        "src_port"  : src_port,
+        "dst_port"  : dst_port,
+        "protocol"  : proto,
+        "size"      : len(packet),
+    }
+
+def process_packet(packet):
+    global packet_number
+
+    if IP not in packet:
+        return
+
+    # Day 3: apply filter before doing anything else
+    if not passes_filter(packet):
+        return
+
+    packet_number += 1
+    info = extract_info(packet)
+
+    # Store in memory
+    packet_store.append(info)
+    if len(packet_store) > MAX_STORE:
+        packet_store.pop(0)
+
+    # Print live line
+    src = f"{info['src_ip']}:{info['src_port'] or '-'}"
+    dst = f"{info['dst_ip']}:{info['dst_port'] or '-'}"
+    print(f"[{info['timestamp']}] #{packet_number:04d} | "
+          f"{info['protocol']:<5} | {info['size']:>5}B | "
+          f"{src:<26} -> {dst}")
+
+    # Day 4: run all three detectors on every packet
+    check_blacklist(info["src_ip"], info["dst_ip"])
+    check_port_scan(info["src_ip"], info["dst_port"])
+
+    if ICMP in packet:
+        check_ping_flood(info["src_ip"])
+
+
+# ─── MAIN ─────────────────────────────────────────────────────
+print("=" * 60)
+print(f"  NIDS — Days 3+4  |  interface: {INTERFACE}")
+print(f"  Protocol filter  : {FILTER_PROTO}")
+print(f"  Port scan limit  : {PORT_SCAN_THRESHOLD} ports / {TIME_WINDOW_SECONDS}s")
+print(f"  Ping flood limit : {PING_FLOOD_THRESHOLD} pings / {TIME_WINDOW_SECONDS}s")
+print(f"  Blacklisted IPs  : {len(BLACKLISTED_IPS)}")
+print("=" * 60)
+
+try:
+    sniff(iface=INTERFACE, prn=process_packet, count=0, store=False)
+except KeyboardInterrupt:
+    print(f"\nStopped. {packet_number} packets | {len(alert_log)} alerts")
+    if alert_log:
+        print("\nAll alerts generated this session:")
+        for a in alert_log:
+            print(f"  [{a['timestamp']}] {a['type']} from {a['src_ip']} — {a['detail']}")
