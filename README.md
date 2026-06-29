@@ -12,8 +12,8 @@ Built on Kali Linux as a 10-day learning project.
 - [x] Port scan detection (sliding time window)
 - [x] Ping flood detection
 - [x] Blacklisted IP alerting
-- [ ] Brute force detection
-- [ ] Alert logging to CSV and SQLite
+- [x] Brute force detection
+- [x] Alert logging to CSV and SQLite
 - [ ] Tkinter live dashboard
 
 ## Tech Stack
