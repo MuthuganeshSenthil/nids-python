@@ -1,0 +1,17 @@
+NIDS SECURITY REPORT
+Generated: 2026-07-01 07:24:02.347799
+Total alerts: 3
+
+ALERT TYPES
+----------------------------------------
+BRUTE_FORCE          3 alerts
+
+TOP ATTACKERS
+----------------------------------------
+10.200.44.250        3 alerts
+
+ALL ALERTS
+----------------------------------------
+[19:38:17] BRUTE_FORCE | 10.200.44.250 | 5 connections to port 53 in 5s
+[19:37:36] BRUTE_FORCE | 10.200.44.250 | 5 connections to port 53 in 5s
+[19:36:17] BRUTE_FORCE | 10.200.44.250 | 5 connections to port 53 in 5s
